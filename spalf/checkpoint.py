@@ -9,10 +9,9 @@ from safetensors.torch import load_file, load_model, save_file
 from torch import Tensor
 
 from spalf.config import CalibrationResult, SPALFConfig
+from spalf.constants import DEVICE
 from spalf.model import StratifiedSAE
 from spalf.whitening.whitener import SoftZCAWhitener
-
-device = torch.device("cuda")
 
 
 def save_calibration_state(
@@ -40,6 +39,10 @@ def save_calibration_state(
             "V": cal.V,
             "F": cal.F,
             "L0_target": cal.L0_target,
+            "tau_faith": cal.tau_faith,
+            "tau_drift": cal.tau_drift,
+            "tau_ortho": cal.tau_ortho,
+            "tau_kl": cal.tau_kl,
         },
     }
     with open(ckpt_dir / "metadata.json", "w") as f:
@@ -59,30 +62,15 @@ def load_checkpoint(
 
     sae = StratifiedSAE(d=cal_data["d"], F=cal_data["F"], V=cal_data["V"])
     load_model(sae, str(ckpt_dir / "model.safetensors"))
-    sae.to(device)
+    sae.to(DEVICE)
     sae.eval()
 
     cal_state = load_file(
-        str(ckpt_dir / "calibration.safetensors"), device=str(device)
+        str(ckpt_dir / "calibration.safetensors"), device=str(DEVICE)
     )
     whitener = SoftZCAWhitener.__new__(SoftZCAWhitener)
     whitener.load_state_dict(cal_state)
 
     W_vocab = cal_state["W_vocab"]
-
-    print(
-        json.dumps(
-            {
-                "event": "checkpoint_loaded",
-                "step": metadata["step"],
-                "d": cal_data["d"],
-                "F": cal_data["F"],
-                "V": cal_data["V"],
-                "path": str(ckpt_dir),
-            },
-            sort_keys=True,
-        ),
-        flush=True,
-    )
 
     return sae, whitener, W_vocab

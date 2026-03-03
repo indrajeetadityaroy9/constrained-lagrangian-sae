@@ -1,13 +1,12 @@
 """Activation streaming via HuggingFace model hooks."""
 
 from collections.abc import Iterator
-import json
 
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-device = torch.device("cuda")
+from spalf.constants import DEVICE
 
 
 class ActivationStore:
@@ -34,23 +33,12 @@ class ActivationStore:
         self.dataset_split = dataset_split
         self.dataset_config = dataset_config
         self.seed = seed
-        self.device = device
+        self.device = DEVICE
 
         self._hook_handle = None
         self._captured_activations: torch.Tensor | None = None
         self._token_iter: Iterator[torch.Tensor] | None = None
 
-        print(
-            json.dumps(
-                {
-                    "event": "model_loaded",
-                    "backend": "huggingface",
-                    "model_name": self.model_name,
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
@@ -135,6 +123,34 @@ class ActivationStore:
         acts = self._captured_activations
 
         return acts.reshape(-1, acts.shape[-1]).float()
+
+    def token_iterator(self) -> Iterator[torch.Tensor]:
+        """Return a fresh token batch iterator (independent of the internal one used by next_batch)."""
+        return self._token_generator()
+
+    @property
+    def last_activations(self) -> torch.Tensor | None:
+        """Last captured residual-stream activations [B, S, d], or None before first forward."""
+        return self._captured_activations
+
+    @property
+    def target_module(self) -> torch.nn.Module:
+        """The hooked transformer module (for patching)."""
+        return self._hf_target_module
+
+    def swap_hook(self, new_hook_fn):
+        """Temporarily replace the activation-capture hook with a custom one.
+
+        Returns a handle for the new hook. The caller must call handle.remove()
+        and then self.restore_hook() when done.
+        """
+        if self._hook_handle is not None:
+            self._hook_handle.remove()
+        return self._hf_target_module.register_forward_hook(new_hook_fn)
+
+    def restore_hook(self) -> None:
+        """Re-register the default activation-capture hook."""
+        self._register_hf_hook(self.model)
 
     def get_unembedding_matrix(self) -> torch.Tensor:
         """Get W_vocab: the unembedding matrix [d_model, V]."""

@@ -11,11 +11,9 @@ import torch.nn.functional as F
 
 from spalf.data.activation_store import ActivationStore
 from spalf.data.patching import run_patched_forward
+from spalf.evaluation import EVAL_TOKENS
 from spalf.model import StratifiedSAE
 from spalf.whitening.whitener import SoftZCAWhitener
-
-# 2^21 tokens ≈ 2M, matching JumpReLU / Gemma Scope evaluation standard.
-_EVAL_TOKENS: int = 2_097_152
 
 
 @torch.no_grad()
@@ -27,14 +25,14 @@ def evaluate_downstream_loss(
     """Evaluate delta CE loss and KL divergence under SAE patching."""
     device = next(sae.parameters()).device
     tokens_per_batch = store.batch_size * store.seq_len
-    n_eval_batches = _EVAL_TOKENS // tokens_per_batch
+    n_eval_batches = EVAL_TOKENS // tokens_per_batch
 
     total_ce_orig = 0.0
     total_ce_patched = 0.0
     total_kl = 0.0
     total_tokens = 0
 
-    token_iter = store._token_generator()
+    token_iter = store.token_iterator()
 
     for _ in range(n_eval_batches):
         tokens = next(token_iter).to(device)
@@ -42,7 +40,7 @@ def evaluate_downstream_loss(
         labels = tokens[:, 1:]
         n_tok = B * (S - 1)
 
-        orig_logits, patched_logits, _, _, _, _ = run_patched_forward(
+        orig_logits, patched_logits, _, _, _ = run_patched_forward(
             store, sae, whitener, tokens
         )
 

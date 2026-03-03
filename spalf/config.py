@@ -33,6 +33,11 @@ class SPALFConfig:
     R2_target: float = 0.97
     V_cap: int | None = None
     lr: float = 3e-4
+    warmup_steps: int = 1000
+    lr_min_ratio: float = 0.1
+
+    delta_drift: float = 0.1
+    resample_interval: int = 25000
 
     seed: int = 42
     output_dir: str = "runs/default"
@@ -70,3 +75,4 @@ class CalibrationResult:
     tau_faith: float
     tau_drift: float
     tau_ortho: float
+    tau_kl: float | None = None

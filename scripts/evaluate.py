@@ -43,13 +43,6 @@ def run_eval(config: SPALFConfig) -> dict:
     with open(ckpt_meta_path) as f:
         ckpt_metadata = json.load(f)
 
-    print(
-        json.dumps(
-            {"event": "eval_store_init", "model_name": config.model_name},
-            sort_keys=True,
-        ),
-        flush=True,
-    )
     store = ActivationStore(
         model_name=config.model_name,
         hook_point=config.hook_point,
@@ -75,19 +68,10 @@ def run_eval(config: SPALFConfig) -> dict:
         },
     }
 
-    print(json.dumps({"event": "eval_suite_start", "suite": "downstream_loss"}, sort_keys=True), flush=True)
     results["downstream_loss"] = evaluate_downstream_loss(sae, whitener, store)
-
-    print(json.dumps({"event": "eval_suite_start", "suite": "sparsity_frontier"}, sort_keys=True), flush=True)
     results["sparsity_frontier"] = compute_sparsity_frontier(sae, whitener, store)
-
-    print(json.dumps({"event": "eval_suite_start", "suite": "drift_fidelity"}, sort_keys=True), flush=True)
     results["drift_fidelity"] = drift_fidelity(sae.W_dec_A, W_vocab)
-
-    print(json.dumps({"event": "eval_suite_start", "suite": "feature_absorption"}, sort_keys=True), flush=True)
     results["feature_absorption"] = feature_absorption_rate(sae.W_dec_B, W_vocab)
-
-    print(json.dumps({"event": "eval_suite_start", "suite": "dead_latents"}, sort_keys=True), flush=True)
     results["dead_latents"] = count_dead_latents(sae, whitener, store)
 
     return results
@@ -104,16 +88,6 @@ def write_results(config: SPALFConfig, results: dict) -> None:
     with open(metrics_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
 
-    print(
-        json.dumps(
-            {"event": "eval_results_written", "path": str(metrics_path)},
-            sort_keys=True,
-        ),
-        flush=True,
-    )
-    for suite_name in results:
-        if not suite_name.startswith("_"):
-            print(json.dumps({"event": "eval_suite_complete", "suite": suite_name}, sort_keys=True), flush=True)
 
 
 def main() -> None:

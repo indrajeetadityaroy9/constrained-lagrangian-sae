@@ -4,19 +4,18 @@ import math
 
 import torch
 
-device = torch.device("cuda")
-
 
 class OnlineCovariance:
     """Welford online covariance estimation with snapshot-based convergence."""
 
-    def __init__(self, d: int) -> None:
+    def __init__(self, d: int, device: torch.device | None = None) -> None:
         self.d = d
         self.check_interval = min(math.ceil(d**2), 1_000_000)
+        self._device = device or torch.device("cuda")
 
         self._n = 0
-        self._mean = torch.zeros(d, dtype=torch.float64, device=device)
-        self._M2 = torch.zeros(d, d, dtype=torch.float64, device=device)
+        self._mean = torch.zeros(d, dtype=torch.float64, device=self._device)
+        self._M2 = torch.zeros(d, d, dtype=torch.float64, device=self._device)
 
         self._snapshot_cov: torch.Tensor | None = None
         self._n_at_snapshot = 0
@@ -60,6 +59,8 @@ class OnlineCovariance:
         if self._snapshot_cov is not None:
             diff_norm = torch.linalg.norm(current_cov - self._snapshot_cov)
             current_norm = torch.linalg.norm(current_cov)
+            if current_norm == 0:
+                return
             relative_change = diff_norm / current_norm
 
             if relative_change < 1.0 / self.d:

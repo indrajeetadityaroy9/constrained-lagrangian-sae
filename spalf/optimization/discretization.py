@@ -4,16 +4,16 @@ import torch
 
 
 class DiscretizationSchedule:
-    """Discretization weight schedule with dynamic onset.
+    """Linear ramp from onset to T_total.
 
-    Ramps linearly from onset_step to T_total. No disc penalty before onset.
-    Onset is set dynamically when all constraints are satisfied.
+    Weight converges to 1.0: disc penalty matches L0 objective in scale
+    at convergence (both are batch-averaged). Onset is set dynamically
+    when all base constraints are satisfied.
     """
 
-    def __init__(self, T_total: int, lambda_max: float = 1.0) -> None:
+    def __init__(self, T_total: int) -> None:
         self.T_total = T_total
         self.onset_step = T_total
-        self.lambda_max = lambda_max
 
     def set_onset(self, step: int) -> None:
         """Set the step at which disc ramp begins."""
@@ -23,7 +23,9 @@ class DiscretizationSchedule:
         if step <= self.onset_step:
             return 0.0
         remaining = self.T_total - self.onset_step
-        return self.lambda_max * (step - self.onset_step) / remaining
+        if remaining <= 0:
+            return 1.0
+        return (step - self.onset_step) / remaining
 
     def state_dict(self) -> dict:
         return {"onset_step": torch.tensor(self.onset_step)}

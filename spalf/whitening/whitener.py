@@ -5,8 +5,6 @@ Regularization via Oracle Approximating Shrinkage (OAS):
     λ_reg_i = (1 - ρ) · λ_i + ρ · μ  where μ = mean(λ), ρ = OAS shrinkage intensity.
 """
 
-import json
-
 import torch
 from torch import Tensor
 
@@ -53,20 +51,6 @@ class SoftZCAWhitener:
 
             self._inv_scale_k = self._Lambda_k.sqrt()
             self._inv_scale_tail = self._lambda_bar ** 0.5
-
-            print(
-                json.dumps(
-                    {
-                        "event": "whitener_ready",
-                        "mode": "low_rank",
-                        "d": self.d,
-                        "k": self._k,
-                        "rho_oas": self.rho_oas,
-                    },
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
         else:
             scales = reg_eigenvalues.rsqrt()
             U = self._eigenvectors
@@ -76,20 +60,6 @@ class SoftZCAWhitener:
             self._W_white_inv = U @ torch.diag(inv_scales) @ U.T
 
             self._precision = self._W_white.T @ self._W_white
-
-            print(
-                json.dumps(
-                    {
-                        "event": "whitener_ready",
-                        "mode": "full",
-                        "d": self.d,
-                        "k": self._k,
-                        "rho_oas": self.rho_oas,
-                    },
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
 
     @classmethod
     def from_covariance(cls, cov: OnlineCovariance) -> "SoftZCAWhitener":
@@ -111,21 +81,6 @@ class SoftZCAWhitener:
         num = (1 - 2.0 / d) * trace_s2 + trace_s ** 2
         denom = (n_samples + 1 - 2.0 / d) * (trace_s2 - trace_s ** 2 / d)
         rho_oas = max(0.0, min(num / denom, 1.0))
-
-        print(
-            json.dumps(
-                {
-                    "event": "covariance_spectrum",
-                    "lambda_max": eigenvalues[0].item(),
-                    "lambda_min": eigenvalues[-1].item(),
-                    "condition_number": (eigenvalues[0] / eigenvalues[-1]).item(),
-                    "n_samples": n_samples,
-                    "rho_oas": rho_oas,
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
 
         return cls(
             mean=mean,

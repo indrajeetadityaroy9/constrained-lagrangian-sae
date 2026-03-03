@@ -5,19 +5,17 @@ Evaluation budget: ~2M tokens (2^21) per phase, matching Rajamanoharan et al.
 parameter space of log_threshold.
 """
 
-import json
 import math
 
 import torch
 import torch.nn.functional as F
 
+from spalf.constants import EPS_NUM
 from spalf.data.activation_store import ActivationStore
 from spalf.data.patching import run_patched_forward, run_zero_ablation_forward
+from spalf.evaluation import EVAL_TOKENS
 from spalf.model import StratifiedSAE
 from spalf.whitening.whitener import SoftZCAWhitener
-
-# 2^21 tokens ≈ 2M, matching JumpReLU / Gemma Scope evaluation standard.
-_EVAL_TOKENS: int = 2_097_152
 
 
 @torch.no_grad()
@@ -29,7 +27,7 @@ def compute_sparsity_frontier(
     """Sweep threshold multipliers to trace the L0-vs-Loss-Recovered frontier."""
     device = next(sae.parameters()).device
     tokens_per_batch = store.batch_size * store.seq_len
-    n_eval_batches = _EVAL_TOKENS // tokens_per_batch
+    n_eval_batches = EVAL_TOKENS // tokens_per_batch
 
     # Log-uniform spacing: uniform in log_threshold's native space.
     multipliers = torch.logspace(math.log10(0.5), math.log10(3.0), 9).tolist()
@@ -39,7 +37,7 @@ def compute_sparsity_frontier(
     total_ce_orig = 0.0
     total_tokens_baseline = 0
 
-    baseline_iter = store._token_generator()
+    baseline_iter = store.token_iterator()
     for _ in range(n_eval_batches):
         tokens = next(baseline_iter).to(device)
         B, S = tokens.shape
@@ -62,20 +60,7 @@ def compute_sparsity_frontier(
 
     avg_ce_orig = total_ce_orig / total_tokens_baseline
     avg_ce_zero = total_ce_zero / total_tokens_baseline
-    denominator = avg_ce_zero - avg_ce_orig
-
-    print(
-        json.dumps(
-            {
-                "event": "frontier_baseline",
-                "ce_orig": avg_ce_orig,
-                "ce_zero": avg_ce_zero,
-                "baseline_tokens": total_tokens_baseline,
-            },
-            sort_keys=True,
-        ),
-        flush=True,
-    )
+    denominator = max(avg_ce_zero - avg_ce_orig, EPS_NUM)
 
     # --- Sweep multipliers ---
     orig_log_threshold = sae.log_threshold.data.clone()
@@ -91,13 +76,13 @@ def compute_sparsity_frontier(
         total_tokens = 0
         total_activations = 0
 
-        token_iter = store._token_generator()
+        token_iter = store.token_iterator()
 
         for _ in range(n_eval_batches):
             tokens = next(token_iter).to(device)
             B, S = tokens.shape
 
-            orig_logits, patched_logits, x_flat, x_hat_flat, _, gate_mask = (
+            orig_logits, patched_logits, x_flat, x_hat_flat, gate_mask = (
                 run_patched_forward(store, sae, whitener, tokens)
             )
 

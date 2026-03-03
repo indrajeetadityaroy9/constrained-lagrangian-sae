@@ -5,6 +5,8 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+_BLOCK_SIZE: int = 1024
+
 
 @triton.jit
 def _fused_jumprelu_fwd_kernel(
@@ -141,8 +143,7 @@ class FusedJumpReLUFunction(torch.autograd.Function):
         l0 = torch.empty_like(pre_act)
         disc = torch.empty_like(pre_act)
 
-        BLOCK_SIZE = 1024
-        grid = ((n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+        grid = ((n_elements + _BLOCK_SIZE - 1) // _BLOCK_SIZE,)
 
         _fused_jumprelu_fwd_kernel[grid](
             pre_act, theta,
@@ -150,7 +151,7 @@ class FusedJumpReLUFunction(torch.autograd.Function):
             lambda_disc,
             n_elements,
             F=F,
-            BLOCK_SIZE=BLOCK_SIZE,
+            BLOCK_SIZE=_BLOCK_SIZE,
         )
 
         ctx.save_for_backward(pre_act, theta, gamma)
@@ -173,20 +174,19 @@ class FusedJumpReLUFunction(torch.autograd.Function):
         grad_pre_act_from_l0 = torch.zeros_like(pre_act)
         grad_theta_total = torch.zeros(F, device=pre_act.device, dtype=pre_act.dtype)
 
-        BLOCK_SIZE = 1024
-        grid = ((n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+        grid = ((n_elements + _BLOCK_SIZE - 1) // _BLOCK_SIZE,)
 
         _moreau_ste_bwd_kernel[grid](
             grad_l0, pre_act, theta, gamma,
             grad_pre_act_from_l0, grad_theta_total,
-            n_elements, F=F, BLOCK_SIZE=BLOCK_SIZE,
+            n_elements, F=F, BLOCK_SIZE=_BLOCK_SIZE,
         )
 
         # Reconstruction-loss STE: route grad_z to theta via Moreau envelope (Eq. 11).
         _recon_ste_bwd_kernel[grid](
             grad_z, pre_act, theta, gamma,
             grad_theta_total,
-            n_elements, F=F, BLOCK_SIZE=BLOCK_SIZE,
+            n_elements, F=F, BLOCK_SIZE=_BLOCK_SIZE,
         )
 
         below = pre_act * (1.0 - gate)

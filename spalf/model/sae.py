@@ -1,13 +1,16 @@
 """Stratified Sparse Autoencoder: V anchored + (F-V) free decoder columns.
 
 JumpReLU gating with learnable log-thresholds and Moreau bandwidth (γ).
-Forward/backward logic lives in the fused Triton kernel (src/model/kernel.py).
+Forward/backward logic lives in the fused Triton kernel (spalf/model/kernel.py).
 """
+
+import math
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
+from spalf.constants import EPS_NUM
 from spalf.model.kernel import FusedJumpReLUFunction
 
 
@@ -54,15 +57,17 @@ class StratifiedSAE(nn.Module):
         return x_hat, z, gate_mask, l0_probs, disc_raw
 
     @torch.no_grad()
-    def recalibrate_gamma(self, pre_act: Tensor, c_epsilon: float) -> None:
-        """Recalibrate Moreau bandwidth from threshold-local IQR.
+    def recalibrate_gamma(self, pre_act: Tensor) -> None:
+        """Recalibrate Moreau bandwidth via density-matched transition zone.
 
-        Restricts IQR to a ±2σ window around each feature's threshold so gamma
-        tracks jump-region curvature rather than the full pre-activation spread.
+        Sets each feature's transition zone width so that its probability mass
+        under a Gaussian reference equals the per-feature firing rate q = L0/F.
+        Derivation: c = q / (1.35 * phi(z_q)) where z_q = Phi^{-1}(1-q).
         """
         thresholds = self.log_threshold.exp()
         std_all = pre_act.std(dim=0)
 
+        # Threshold-local IQR (±2σ window).
         lower = thresholds - 2.0 * std_all
         upper = thresholds + 2.0 * std_all
         mask = (pre_act > lower.unsqueeze(0)) & (pre_act < upper.unsqueeze(0))
@@ -74,10 +79,64 @@ class StratifiedSAE(nn.Module):
         iqr = q75 - q25
         iqr = torch.where(iqr.isnan(), std_all, iqr)
 
-        self.gamma.copy_((c_epsilon * iqr).pow(2) / 2.0)
+        # Per-feature firing rate → density-matched scale factor.
+        q = (pre_act > thresholds.unsqueeze(0)).float().mean(dim=0)
+        q = q.clamp(min=1.0 / self.F)  # floor for dead features
+        z_q = torch.erfinv(1.0 - 2.0 * q) * math.sqrt(2)
+        phi_zq = torch.exp(-z_q.pow(2) / 2.0) / math.sqrt(2 * math.pi)
+        c = (q / (1.35 * phi_zq)).clamp(max=1.0)  # cap: zone <= IQR
+
+        self.gamma.copy_((c * iqr).pow(2) / 2.0)
+
+    @torch.no_grad()
+    def resample_dead_free(
+        self,
+        dead_mask: Tensor,
+        x_tilde: Tensor,
+        optimizer: torch.optim.Optimizer,
+    ) -> int:
+        """Resample dead free features via loss-proportional direction sampling.
+
+        Only free features (indices >= V) are resampled; anchored features are
+        vocabulary-tied and must not be disturbed.
+        """
+        dead_mask[:self.V] = False
+        dead_idx = dead_mask.nonzero(as_tuple=True)[0]
+        n = dead_idx.shape[0]
+        if n == 0:
+            return 0
+        free_idx = dead_idx - self.V
+
+        # Loss-proportional direction sampling.
+        x_hat, _, _, _, _ = self(x_tilde)
+        losses = (x_tilde - x_hat).pow(2).sum(dim=1)
+        sampled = x_tilde[torch.multinomial(losses / losses.sum(), n, replacement=True)]
+        dirs = sampled / sampled.norm(dim=1, keepdim=True).clamp(min=EPS_NUM)
+
+        self.W_dec_B.data[:, free_idx] = dirs.T
+        self.W_enc.data[dead_idx] = dirs
+        active = ~dead_mask
+        self.log_threshold.data[dead_idx] = self.log_threshold.data[active].median()
+        self.gamma[dead_idx] = self.gamma[active].median()
+
+        # Zero Adam state for affected parameters.
+        for p in optimizer.state:
+            s = optimizer.state[p]
+            if "exp_avg" not in s:
+                continue
+            if p.shape == self.W_enc.shape:
+                s["exp_avg"][dead_idx] = 0
+                s["exp_avg_sq"][dead_idx] = 0
+            elif p.shape == self.W_dec_B.shape:
+                s["exp_avg"][:, free_idx] = 0
+                s["exp_avg_sq"][:, free_idx] = 0
+            elif p.shape == self.log_threshold.shape:
+                s["exp_avg"][dead_idx] = 0
+                s["exp_avg_sq"][dead_idx] = 0
+        return n
 
     @torch.no_grad()
     def normalize_free_decoder(self) -> None:
         """Project free decoder columns to unit norm. Called after each optimizer step."""
-        norms = self.W_dec_B.norm(dim=0, keepdim=True)
+        norms = self.W_dec_B.norm(dim=0, keepdim=True).clamp(min=EPS_NUM)
         self.W_dec_B.div_(norms)

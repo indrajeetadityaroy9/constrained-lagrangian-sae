@@ -5,9 +5,6 @@ from torch import Tensor
 
 from spalf.constants import EPS_NUM
 
-# Number of columns to sample for stochastic orthogonality estimation.
-_ORTHO_SAMPLE_COLS: int = 512
-
 
 def compute_faithfulness_violation(
     mahal_sq: Tensor,
@@ -39,7 +36,7 @@ def compute_orthogonality_violation(
     Provides an unbiased estimate of the activation-weighted off-diagonal coherence.
     """
     F_total = W_dec_A.shape[1] + W_dec_B.shape[1]
-    k = min(_ORTHO_SAMPLE_COLS, F_total)
+    k = min(F_total, int(F_total**0.5) + 1)
 
     # Sample column indices (uniform without replacement).
     idx = torch.randperm(F_total, device=W_dec_A.device)[:k]

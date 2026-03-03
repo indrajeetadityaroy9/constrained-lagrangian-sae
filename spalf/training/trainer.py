@@ -13,8 +13,8 @@ from accelerate.utils import ProjectConfiguration
 from spalf.config import CalibrationResult, SPALFConfig
 from spalf.constants import (
     BETA_SLOW,
+    DEVICE,
     EPS_NUM,
-    LAMBDA_DISC_MAX,
 )
 from spalf.data.activation_store import ActivationStore
 from spalf.data.buffer import ActivationBuffer
@@ -25,15 +25,11 @@ from spalf.model.constraints import (
     compute_orthogonality_violation,
 )
 from spalf.model.initialization import initialize_from_calibration
-from spalf.optimization.capu import MonotoneCAPU
 from spalf.optimization.discretization import DiscretizationSchedule
-from spalf.optimization.dual_updater import NuPIDualUpdater
-from spalf.optimization.ema_filter import DualRateEMA
+from spalf.optimization.dual_controller import DualController
 from spalf.training.calibration import run_calibration
 from spalf.training.loop import run_training_loop
 from spalf.whitening.whitener import SoftZCAWhitener
-
-device = torch.device("cuda")
 
 
 @torch.no_grad()
@@ -44,20 +40,26 @@ def _measure_initial_violations(
     buffer: ActivationBuffer,
     cal: CalibrationResult,
     batch_size: int,
+    n_batches: int = 8,
 ) -> torch.Tensor:
-    """Measure initial constraint violations for CAPU calibration."""
-    x = buffer.next_batch(batch_size).to(device)
-    x_tilde = whitener.forward(x)
-    x_hat, z, _, _, _ = sae(x_tilde)
+    """Measure initial constraint violations for CAPU calibration (multi-batch average)."""
+    accum = torch.zeros(3, device=DEVICE)
+    for _ in range(n_batches):
+        x = buffer.next_batch(batch_size).to(DEVICE)
+        x_tilde = whitener.forward(x)
+        x_hat, z, _, _, _ = sae(x_tilde)
 
-    mahal_sq = whitener.compute_mahalanobis_sq(x - x_hat)
-    v_faith = compute_faithfulness_violation(mahal_sq, cal.tau_faith)
-    v_drift = compute_drift_violation(sae.W_dec_A, W_vocab, cal.tau_drift)
-    v_ortho = compute_orthogonality_violation(
-        z, sae.W_dec_A, sae.W_dec_B, cal.tau_ortho, sae.gamma
-    )
+        mahal_sq = whitener.compute_mahalanobis_sq(x - x_hat)
+        v_faith = compute_faithfulness_violation(mahal_sq, cal.tau_faith)
+        v_drift = compute_drift_violation(sae.W_dec_A, W_vocab, cal.tau_drift)
+        v_ortho = compute_orthogonality_violation(
+            z, sae.W_dec_A, sae.W_dec_B, cal.tau_ortho, sae.gamma
+        )
+        accum += torch.stack([v_faith, v_drift, v_ortho]).abs()
 
-    return torch.stack([v_faith, v_drift, v_ortho]).abs()
+    # 4th element = 1.0 (neutral placeholder for KL, calibrated at onset).
+    base = accum / n_batches
+    return torch.cat([base, torch.ones(1, device=DEVICE)])
 
 
 def train(config: SPALFConfig) -> StratifiedSAE:
@@ -77,18 +79,6 @@ def train(config: SPALFConfig) -> StratifiedSAE:
         project_configuration=project_config,
     )
 
-    print(
-        json.dumps(
-            {
-                "event": "train_start",
-                "model_name": config.model_name,
-                "output_dir": config.output_dir,
-                "seed": config.seed,
-            },
-            sort_keys=True,
-        ),
-        flush=True,
-    )
     store = ActivationStore(
         model_name=config.model_name,
         hook_point=config.hook_point,
@@ -106,89 +96,53 @@ def train(config: SPALFConfig) -> StratifiedSAE:
     cal = run_calibration(config, store)
 
     sae = initialize_from_calibration(cal, store)
-    sae = sae.to(device)
+    sae = sae.to(DEVICE)
     sae = torch.compile(sae, mode="max-autotune")
-
-    # R = ceil(log2(F/d)) enforces fast/slow separation for two-timescale updates.
-    R = math.ceil(math.log2(cal.F / cal.d))
-    beta_fast = 1.0 - R * (1.0 - BETA_SLOW)
-    slow_update_interval = round(1.0 / (1.0 - BETA_SLOW))
 
     initial_violations = _measure_initial_violations(
         sae, cal.whitener, cal.W_vocab, buffer, cal, config.batch_size
     )
-    print(
-        json.dumps(
-            {
-                "event": "initial_violations",
-                "faith": initial_violations[0].item(),
-                "drift": initial_violations[1].item(),
-                "ortho": initial_violations[2].item(),
-            },
-            sort_keys=True,
-        ),
-        flush=True,
-    )
     rho_0 = 1.0 / (initial_violations.abs().mean().item() + EPS_NUM)
 
-    ema = DualRateEMA(
-        n_constraints=3,
-        beta_fast=beta_fast,
-        beta_slow=BETA_SLOW,
-    )
-
-    dual_updater = NuPIDualUpdater(n_constraints=3)
-
-    capu = MonotoneCAPU(
+    controller = DualController(
         initial_violations=initial_violations,
         rho_0=rho_0,
-        beta_slow=BETA_SLOW,
+        beta=BETA_SLOW,
         eps_num=EPS_NUM,
     )
 
     total_steps = config.total_tokens // config.batch_size
-    disc_schedule = DiscretizationSchedule(
-        T_total=total_steps,
-        lambda_max=LAMBDA_DISC_MAX,
-    )
+    disc_schedule = DiscretizationSchedule(T_total=total_steps)
 
     optimizer = torch.optim.Adam(sae.parameters(), lr=config.lr, betas=(0.9, 0.999))
 
-    sae, optimizer = accelerator.prepare(sae, optimizer)
-    accelerator.register_for_checkpointing(dual_updater, capu, ema, disc_schedule)
+    def _lr_lambda(step: int) -> float:
+        if step < config.warmup_steps:
+            return step / max(config.warmup_steps, 1)
+        progress = (step - config.warmup_steps) / max(total_steps - config.warmup_steps, 1)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return config.lr_min_ratio + (1.0 - config.lr_min_ratio) * cosine
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+
+    sae, optimizer, scheduler = accelerator.prepare(sae, optimizer, scheduler)
+    accelerator.register_for_checkpointing(controller, disc_schedule)
 
     start_step = 0
     if config.resume_from_checkpoint:
         accelerator.load_state(config.resume_from_checkpoint)
         with open(Path(config.resume_from_checkpoint) / "metadata.json") as f:
-            start_step = json.load(f)["step"]
-        print(
-            json.dumps(
-                {
-                    "event": "resume",
-                    "checkpoint": config.resume_from_checkpoint,
-                    "step": start_step,
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
-
-    print(
-        json.dumps(
-            {
-                "event": "train_config",
-                "rho_oas": cal.whitener.rho_oas,
-                "effective_rank": cal.whitener.effective_rank,
-                "V": cal.V,
-                "total_steps": total_steps,
-                "slow_update_interval": slow_update_interval,
-                "rho_0": rho_0,
-            },
-            sort_keys=True,
-        ),
-        flush=True,
-    )
+            ckpt_meta = json.load(f)
+        start_step = ckpt_meta["step"]
+        ckpt_cal = ckpt_meta["calibration"]
+        if "tau_faith" in ckpt_cal:
+            cal.tau_faith = ckpt_cal["tau_faith"]
+        if "tau_drift" in ckpt_cal:
+            cal.tau_drift = ckpt_cal["tau_drift"]
+        if "tau_ortho" in ckpt_cal:
+            cal.tau_ortho = ckpt_cal["tau_ortho"]
+        if "tau_kl" in ckpt_cal:
+            cal.tau_kl = ckpt_cal["tau_kl"]
 
     run_training_loop(
         sae=sae,
@@ -196,20 +150,14 @@ def train(config: SPALFConfig) -> StratifiedSAE:
         W_vocab=cal.W_vocab,
         buffer=buffer,
         config=config,
-        tau_faith=cal.tau_faith,
-        tau_drift=cal.tau_drift,
-        tau_ortho=cal.tau_ortho,
-        dual_updater=dual_updater,
-        capu=capu,
-        ema=ema,
+        controller=controller,
         disc_schedule=disc_schedule,
         optimizer=optimizer,
-        slow_update_interval=slow_update_interval,
+        scheduler=scheduler,
         cal=cal,
         accelerator=accelerator,
         start_step=start_step,
         store=store,
     )
 
-    print(json.dumps({"event": "train_complete"}, sort_keys=True), flush=True)
     return sae
