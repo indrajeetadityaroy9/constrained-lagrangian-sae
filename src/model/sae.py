@@ -1,7 +1,7 @@
 """Stratified Sparse Autoencoder: V anchored + (F-V) free decoder columns.
 
 JumpReLU gating with learnable log-thresholds and Moreau bandwidth (γ).
-Forward/backward logic lives in the fused Triton kernel (spalf/model/kernel.py).
+Forward/backward logic lives in the fused Triton kernel (src/model/kernel.py).
 """
 
 import math
@@ -10,8 +10,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from spalf.constants import EPS_NUM
-from spalf.model.kernel import FusedJumpReLUFunction
+from src.model.kernel import FusedJumpReLUFunction
 
 
 class StratifiedSAE(nn.Module):
@@ -34,6 +33,8 @@ class StratifiedSAE(nn.Module):
 
         self.log_threshold = nn.Parameter(torch.zeros(F))
         self.register_buffer("gamma", torch.ones(F))
+        self.register_buffer("gamma_init", torch.ones(F))
+        self.register_buffer("gamma_init_mean", torch.tensor(1.0))
 
         nn.init.xavier_uniform_(self.W_enc)
         nn.init.xavier_uniform_(self.W_dec_A)
@@ -89,54 +90,7 @@ class StratifiedSAE(nn.Module):
         self.gamma.copy_((c * iqr).pow(2) / 2.0)
 
     @torch.no_grad()
-    def resample_dead_free(
-        self,
-        dead_mask: Tensor,
-        x_tilde: Tensor,
-        optimizer: torch.optim.Optimizer,
-    ) -> int:
-        """Resample dead free features via loss-proportional direction sampling.
-
-        Only free features (indices >= V) are resampled; anchored features are
-        vocabulary-tied and must not be disturbed.
-        """
-        dead_mask[:self.V] = False
-        dead_idx = dead_mask.nonzero(as_tuple=True)[0]
-        n = dead_idx.shape[0]
-        if n == 0:
-            return 0
-        free_idx = dead_idx - self.V
-
-        # Loss-proportional direction sampling.
-        x_hat, _, _, _, _ = self(x_tilde)
-        losses = (x_tilde - x_hat).pow(2).sum(dim=1)
-        sampled = x_tilde[torch.multinomial(losses / losses.sum(), n, replacement=True)]
-        dirs = sampled / sampled.norm(dim=1, keepdim=True).clamp(min=EPS_NUM)
-
-        self.W_dec_B.data[:, free_idx] = dirs.T
-        self.W_enc.data[dead_idx] = dirs
-        active = ~dead_mask
-        self.log_threshold.data[dead_idx] = self.log_threshold.data[active].median()
-        self.gamma[dead_idx] = self.gamma[active].median()
-
-        # Zero Adam state for affected parameters.
-        for p in optimizer.state:
-            s = optimizer.state[p]
-            if "exp_avg" not in s:
-                continue
-            if p.shape == self.W_enc.shape:
-                s["exp_avg"][dead_idx] = 0
-                s["exp_avg_sq"][dead_idx] = 0
-            elif p.shape == self.W_dec_B.shape:
-                s["exp_avg"][:, free_idx] = 0
-                s["exp_avg_sq"][:, free_idx] = 0
-            elif p.shape == self.log_threshold.shape:
-                s["exp_avg"][dead_idx] = 0
-                s["exp_avg_sq"][dead_idx] = 0
-        return n
-
-    @torch.no_grad()
     def normalize_free_decoder(self) -> None:
         """Project free decoder columns to unit norm. Called after each optimizer step."""
-        norms = self.W_dec_B.norm(dim=0, keepdim=True).clamp(min=EPS_NUM)
+        norms = self.W_dec_B.norm(dim=0, keepdim=True)
         self.W_dec_B.div_(norms)

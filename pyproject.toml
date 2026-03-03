@@ -1,5 +1,5 @@
 [project]
-name = "spalf"
+name = "src"
 version = "0.1.0"
 description = "SPALF: Spectrally-Preconditioned Augmented Lagrangian on Stratified Feature Manifolds"
 requires-python = ">=3.10"
@@ -8,19 +8,15 @@ dependencies = [
     "transformers>=4.40,<4.49",
     "datasets>=3.0,<3.3",
     "numpy>=1.26,<2.2",
-    "pyyaml>=6.0,<6.1",
+    "hydra-core>=1.3,<1.4",
+    "omegaconf>=2.3,<2.4",
     "triton>=3.0,<3.2",
     "safetensors>=0.4,<0.5",
-    "accelerate>=1.0,<1.3",
 ]
-
-[project.scripts]
-spalf-train = "scripts.train:main"
-spalf-eval = "scripts.evaluate:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["spalf*", "scripts*"]
+include = ["src*"]

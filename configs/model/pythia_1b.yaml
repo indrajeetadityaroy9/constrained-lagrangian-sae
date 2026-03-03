@@ -1,4 +1,3 @@
 model_name: "EleutherAI/pythia-1.4b"
 hook_point: "gpt_neox.layers.6"
 output_dir: "runs/pythia_1b"
-checkpoint: "runs/pythia_1b/spalf_phase2_final.pt"

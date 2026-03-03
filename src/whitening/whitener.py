@@ -1,14 +1,88 @@
-"""Soft-ZCA whitening transform: full and low-rank variants.
+"""Soft-ZCA whitening: online covariance estimation and isotropic preconditioning.
 
 Regularization via Oracle Approximating Shrinkage (OAS):
     Chen, Wiesel, Eldar, Hero (2010).
-    λ_reg_i = (1 - ρ) · λ_i + ρ · μ  where μ = mean(λ), ρ = OAS shrinkage intensity.
+    lambda_reg_i = (1 - rho) * lambda_i + rho * mu  where mu = mean(lambda), rho = OAS shrinkage intensity.
 """
+
+import math
 
 import torch
 from torch import Tensor
 
-from spalf.whitening.covariance import OnlineCovariance
+from src.constants import DEVICE
+
+
+class OnlineCovariance:
+    """Welford online covariance estimation with snapshot-based convergence."""
+
+    def __init__(self, d: int) -> None:
+        self.d = d
+        self.check_interval = min(math.ceil(d**2), 1_000_000)
+        self._device = DEVICE
+
+        self._n = 0
+        self._mean = torch.zeros(d, dtype=torch.float64, device=self._device)
+        self._M2 = torch.zeros(d, d, dtype=torch.float64, device=self._device)
+
+        self._snapshot_cov: torch.Tensor | None = None
+        self._n_at_snapshot = 0
+        self._converged = False
+
+    def update(self, x: torch.Tensor) -> None:
+        """Update statistics with a batch [batch, d]."""
+        x = x.to(dtype=torch.float64)
+        batch_size = x.shape[0]
+
+        batch_mean = x.mean(dim=0)
+        batch_n = batch_size
+
+        delta = batch_mean - self._mean
+        new_n = self._n + batch_n
+        new_mean = self._mean + delta * (batch_n / new_n)
+
+        batch_centered = x - batch_mean
+        batch_M2 = batch_centered.T @ batch_centered
+        self._M2 += batch_M2 + torch.outer(delta, delta) * (
+            self._n * batch_n / new_n
+        )
+
+        self._mean = new_mean
+        self._n = new_n
+
+        if (
+            not self._converged
+            and self._n - self._n_at_snapshot >= self.check_interval
+        ):
+            self._check_convergence()
+
+    def _check_convergence(self) -> None:
+        current_cov = self.get_covariance()
+
+        if self._snapshot_cov is not None:
+            diff_norm = torch.linalg.norm(current_cov - self._snapshot_cov)
+            current_norm = torch.linalg.norm(current_cov)
+            relative_change = diff_norm / current_norm
+
+            if relative_change < 1.0 / self.d:
+                self._converged = True
+
+        self._snapshot_cov = current_cov
+        self._n_at_snapshot = self._n
+
+    @property
+    def converged(self) -> bool:
+        return self._converged
+
+    def get_mean(self) -> torch.Tensor:
+        return self._mean.clone()
+
+    def get_covariance(self) -> torch.Tensor:
+        return self._M2 / (self._n - 1)
+
+    @property
+    def n_samples(self) -> int:
+        return self._n
 
 
 class SoftZCAWhitener:
@@ -37,7 +111,6 @@ class SoftZCAWhitener:
         else:
             self._k = self.d
 
-        self.effective_rank = self._k
         self.is_low_rank = self._k < self.d // 4
 
         if self.is_low_rank:
@@ -48,16 +121,13 @@ class SoftZCAWhitener:
 
             self._scale_k = self._Lambda_k.rsqrt()
             self._scale_tail = 1.0 / self._lambda_bar ** 0.5
-
-            self._inv_scale_k = self._Lambda_k.sqrt()
-            self._inv_scale_tail = self._lambda_bar ** 0.5
+            self._diff_scale = self._scale_k - self._scale_tail
+            self._diff_scale_sq = self._scale_k.pow(2) - self._scale_tail ** 2
+            self._scale_tail_sq = self._scale_tail ** 2
         else:
             scales = reg_eigenvalues.rsqrt()
             U = self._eigenvectors
             self._W_white = U @ torch.diag(scales) @ U.T
-
-            inv_scales = reg_eigenvalues.sqrt()
-            self._W_white_inv = U @ torch.diag(inv_scales) @ U.T
 
             self._precision = self._W_white.T @ self._W_white
 
@@ -80,7 +150,7 @@ class SoftZCAWhitener:
         trace_s2 = eigenvalues.pow(2).sum().item()
         num = (1 - 2.0 / d) * trace_s2 + trace_s ** 2
         denom = (n_samples + 1 - 2.0 / d) * (trace_s2 - trace_s ** 2 / d)
-        rho_oas = max(0.0, min(num / denom, 1.0))
+        rho_oas = max(0.0, min(num / (denom + 1e-12), 1.0))
 
         return cls(
             mean=mean,
@@ -99,10 +169,10 @@ class SoftZCAWhitener:
             self._U_k = self._U_k.to(device)
             self._Lambda_k = self._Lambda_k.to(device)
             self._scale_k = self._scale_k.to(device)
-            self._inv_scale_k = self._inv_scale_k.to(device)
+            self._diff_scale = self._diff_scale.to(device)
+            self._diff_scale_sq = self._diff_scale_sq.to(device)
         else:
             self._W_white = self._W_white.to(device)
-            self._W_white_inv = self._W_white_inv.to(device)
             self._precision = self._precision.to(device)
 
         return self
@@ -113,46 +183,19 @@ class SoftZCAWhitener:
 
         if self.is_low_rank:
             proj = centered @ self._U_k
-            whitened_proj = proj * self._scale_k
-            result_top = whitened_proj @ self._U_k.T
-
-            complement = centered - (proj @ self._U_k.T)
-            result_tail = complement * self._scale_tail
-
-            return result_top + result_tail
+            return (proj * self._diff_scale) @ self._U_k.T + centered * self._scale_tail
         else:
             return centered @ self._W_white.T
-
-    def inverse(self, x_tilde: Tensor) -> Tensor:
-        """Map whitened activations back to original space."""
-        if self.is_low_rank:
-            proj = x_tilde @ self._U_k
-            unwhitened_proj = proj * self._inv_scale_k
-            result_top = unwhitened_proj @ self._U_k.T
-
-            complement = x_tilde - (proj @ self._U_k.T)
-            result_tail = complement * self._inv_scale_tail
-
-            return result_top + result_tail + self.mean
-        else:
-            return x_tilde @ self._W_white_inv.T + self.mean
 
     def compute_mahalanobis_sq(self, diff: Tensor) -> Tensor:
         """Compute ||diff||^2 in the regularized precision metric."""
         if self.is_low_rank:
             proj = diff @ self._U_k
-            scaled_proj = proj * self._scale_k
-            top_term = (scaled_proj**2).sum(dim=1)
-
-            complement = diff - (proj @ self._U_k.T)
-            tail_term = (complement**2).sum(dim=1) * (self._scale_tail**2)
-
-            return top_term + tail_term
+            return (proj.pow(2) * self._diff_scale_sq).sum(dim=1) + self._scale_tail_sq * diff.pow(2).sum(dim=1)
         else:
             return (diff @ self._precision * diff).sum(dim=1)
 
     def state_dict(self) -> dict:
-        """Serialize whitener state for checkpointing."""
         return {
             "mean": self.mean,
             "eigenvalues": self._eigenvalues,
@@ -161,7 +204,6 @@ class SoftZCAWhitener:
         }
 
     def load_state_dict(self, sd: dict) -> None:
-        """Restore whitener from checkpoint state."""
         self.__init__(
             mean=sd["mean"],
             eigenvalues=sd["eigenvalues"],

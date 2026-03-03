@@ -1,32 +1,24 @@
-"""SPALF training entrypoint. Usage: spalf-train path/to/config.yaml"""
+"""SPALF training entrypoint."""
 
-import argparse
 import os
 
+import hydra
 import torch
+from omegaconf import DictConfig
 
-from spalf.config import SPALFConfig
-from spalf.training.trainer import train
+from src.training.train import train
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
-torch.backends.cudnn.benchmark = True
-torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(True)
-torch.backends.cuda.enable_math_sdp(False)
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="SPALF: Spectrally-Preconditioned Augmented Lagrangian on Stratified Feature Manifolds"
-    )
-    parser.add_argument("config", type=str, help="Path to YAML config file")
-    args = parser.parse_args()
-
-    config = SPALFConfig.load(args.config)
-    train(config)
+@hydra.main(version_base=None, config_path="../configs", config_name="default")
+def main(cfg: DictConfig) -> None:
+    train(cfg)
 
 
 if __name__ == "__main__":

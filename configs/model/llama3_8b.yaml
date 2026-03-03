@@ -3,4 +3,3 @@ hook_point: "model.layers.16"
 batch_size: 2048
 V_cap: 50000
 output_dir: "runs/llama3_8b"
-checkpoint: "runs/llama3_8b/spalf_phase2_final.pt"

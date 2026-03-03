@@ -1,0 +1,27 @@
+defaults:
+  - model: pythia_1b
+  - _self_
+
+dataset: "monology/pile-uncopyrighted"
+dataset_config: null
+text_column: "text"
+dataset_split: "train"
+total_tokens: 1_000_000_000
+batch_size: 4096
+seq_len: 128
+
+F: 0
+L0_target: null
+R2_target: 0.97
+V_cap: null
+lr: 3e-4
+warmup_steps: 1000
+lr_min_ratio: 0.1
+
+delta_drift: 0.1
+
+seed: 42
+output_dir: "runs/default"
+
+resume_from_checkpoint: ""
+checkpoint_interval: 5000

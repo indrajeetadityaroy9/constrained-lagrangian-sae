@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-_BLOCK_SIZE: int = 1024
+_BLOCK_SIZE: int = 2048
 
 
 @triton.jit
@@ -157,6 +157,7 @@ class FusedJumpReLUFunction(torch.autograd.Function):
         ctx.save_for_backward(pre_act, theta, gamma)
         ctx.F = F
         ctx.n_elements = n_elements
+        ctx.lambda_disc = lambda_disc
 
         return z, gate.detach(), l0, disc
 
@@ -190,7 +191,7 @@ class FusedJumpReLUFunction(torch.autograd.Function):
         )
 
         below = pre_act * (1.0 - gate)
-        grad_pre_act_from_disc = grad_disc * 2.0 * below * (1.0 - gate)
+        grad_pre_act_from_disc = grad_disc * ctx.lambda_disc * 2.0 * below * (1.0 - gate)
 
         grad_pre_act_total = grad_pre_act_from_z + grad_pre_act_from_l0 + grad_pre_act_from_disc
 
