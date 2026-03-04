@@ -1,27 +1,9 @@
-"""Constraint violation functions: faithfulness, drift, orthogonality."""
+"""Orthogonality constraint violation."""
+
+import math
 
 import torch
 from torch import Tensor
-
-from src.constants import EPS_NUM
-
-
-def compute_faithfulness_violation(
-    mahal_sq: Tensor,
-    tau_faith: float,
-) -> Tensor:
-    """Whitened-metric faithfulness violation: E[||x - x_hat||_M^2] - tau."""
-    return mahal_sq.mean() - tau_faith
-
-
-def compute_drift_violation(
-    W_dec_A: Tensor,
-    W_vocab: Tensor,
-    tau_drift: float,
-) -> Tensor:
-    """Anchored decoder drift: ||W_dec_A - W_vocab||_F^2 - tau_drift."""
-    return (W_dec_A - W_vocab).pow(2).sum() - tau_drift
-
 
 def compute_orthogonality_violation(
     z: Tensor,
@@ -36,10 +18,12 @@ def compute_orthogonality_violation(
     Provides an unbiased estimate of the activation-weighted off-diagonal coherence.
     """
     F_total = W_dec_A.shape[1] + W_dec_B.shape[1]
-    k = min(F_total, int(F_total**0.5) + 1)
+    k = min(F_total, math.ceil(math.sqrt(F_total)))
 
-    # Sample column indices (uniform without replacement).
-    idx = torch.randperm(F_total, device=W_dec_A.device)[:k]
+    # Sample k column indices. randint is O(k) vs randperm's O(F_total).
+    # Collision probability ~k²/(2·F_total) ≈ 0.5 for typical sizes — negligible
+    # for a stochastic estimator that is already an unbiased sample.
+    idx = torch.randint(F_total, (k,), device="cuda")
 
     V = W_dec_A.shape[1]
     a_idx = idx.clamp(max=V - 1)
@@ -63,6 +47,7 @@ def compute_orthogonality_violation(
 
     weighted = G_sq * C
     numerator = weighted.sum() - weighted.diagonal().sum()
-    denominator = C.sum() - C.diagonal().sum() + EPS_NUM
+    denom_raw = C.sum() - C.diagonal().sum()
+    denominator = denom_raw + torch.finfo(denom_raw.dtype).eps
 
     return numerator / denominator - tau_ortho

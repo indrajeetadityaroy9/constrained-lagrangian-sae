@@ -1,12 +1,11 @@
 """Activation streaming via HuggingFace model hooks."""
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
+import numpy as np
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-from src.constants import DEVICE
 
 
 class ActivationStore:
@@ -33,7 +32,6 @@ class ActivationStore:
         self.dataset_split = dataset_split
         self.dataset_config = dataset_config
         self.seed = seed
-        self.device = DEVICE
 
         self._hook_handle = None
         self._captured_activations: torch.Tensor | None = None
@@ -41,16 +39,14 @@ class ActivationStore:
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
-            device_map=self.device,
+            device_map="cuda",
             attn_implementation="sdpa",
         )
         self.model.eval()
         self._hf_target_module = dict(self.model.named_modules())[self.hook_point]
-
-        def hook_fn(_module, _input, output):
-            self._captured_activations = output[0].detach()
-
-        self._hook_handle = self._hf_target_module.register_forward_hook(hook_fn)
+        self._hook_handle = self._hf_target_module.register_forward_hook(
+            lambda _mod, _inp, out: setattr(self, "_captured_activations", out[0].detach())
+        )
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -71,7 +67,8 @@ class ActivationStore:
                 streaming=True,
             )
             dataset = dataset.select_columns([self.text_column])
-            dataset = dataset.shuffle(seed=self.seed, buffer_size=10_000)
+            # Shuffle buffer holds one full batch of sequences for adequate randomization.
+            dataset = dataset.shuffle(seed=self.seed, buffer_size=self.batch_size * self.seq_len)
             dataset.set_epoch(epoch)
 
             tokenized = dataset.map(
@@ -80,52 +77,48 @@ class ActivationStore:
                 remove_columns=[self.text_column],
             )
 
-            token_buffer: list[int] = []
+            # Pre-allocated numpy buffer avoids Python list overhead.
+            buf = np.empty(target_len * 2, dtype=np.int64)
+            buf_len = 0
             for example in tokenized:
-                token_buffer.extend(example["input_ids"])
-                while len(token_buffer) >= target_len:
-                    batch_tokens = token_buffer[:target_len]
-                    token_buffer = token_buffer[target_len:]
-                    yield torch.tensor(batch_tokens, dtype=torch.long).reshape(
-                        bs, self.seq_len
-                    )
+                ids = example["input_ids"]
+                n = len(ids)
+                # Grow buffer if needed (rare: only when single doc > target_len).
+                if buf_len + n > len(buf):
+                    new_buf = np.empty(buf_len + n + target_len, dtype=np.int64)
+                    new_buf[:buf_len] = buf[:buf_len]
+                    buf = new_buf
+                buf[buf_len : buf_len + n] = ids
+                buf_len += n
+                while buf_len >= target_len:
+                    yield torch.from_numpy(buf[:target_len].copy()).reshape(bs, self.seq_len)
+                    remaining = buf_len - target_len
+                    buf[:remaining] = buf[target_len : buf_len]
+                    buf_len = remaining
 
             epoch += 1
 
     @torch.no_grad()
     def next_batch(self) -> torch.Tensor:
         """Return next activation batch flattened to [N, d_model]."""
-        tokens = next(self._token_iter).to(self.device)
+        tokens = next(self._token_iter).cuda()
         self.model(tokens)
         acts = self._captured_activations
 
         return acts.reshape(-1, acts.shape[-1]).float()
 
-    def token_iterator(self, batch_size: int | None = None) -> Iterator[torch.Tensor]:
-        """Return a fresh token batch iterator (independent of the internal one used by next_batch)."""
-        return self._token_generator(batch_size)
-
-    @property
-    def last_activations(self) -> torch.Tensor:
-        return self._captured_activations
-
-    def swap_hook(self, new_hook_fn):
+    def swap_hook(self, new_hook_fn: Callable) -> torch.utils.hooks.RemovableHook:
         """Replace the activation-capture hook. Caller must call handle.remove() + restore_hook()."""
         self._hook_handle.remove()
         return self._hf_target_module.register_forward_hook(new_hook_fn)
 
     def restore_hook(self) -> None:
         """Re-register the default activation-capture hook."""
-        def hook_fn(_module, _input, output):
-            self._captured_activations = output[0].detach()
-
-        self._hook_handle = self._hf_target_module.register_forward_hook(hook_fn)
+        self._hook_handle = self._hf_target_module.register_forward_hook(
+            lambda _mod, _inp, out: setattr(self, "_captured_activations", out[0].detach())
+        )
 
     def get_unembedding_matrix(self) -> torch.Tensor:
         """Get W_vocab: the unembedding matrix [d_model, V]."""
         lm_head = self.model.get_output_embeddings()
         return lm_head.weight.T.float()
-
-    @property
-    def d_model(self) -> int:
-        return self.model.config.hidden_size

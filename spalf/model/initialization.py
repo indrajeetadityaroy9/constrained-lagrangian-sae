@@ -3,9 +3,10 @@
 import torch
 from torch import Tensor
 
-from src.activations.activation_store import ActivationStore
-from src.model.sae import StratifiedSAE
-from src.whitening.whitener import SoftZCAWhitener
+from spalf.data.store import ActivationStore
+from spalf.model.constraints import compute_orthogonality_violation
+from spalf.model.sae import StratifiedSAE
+from spalf.whitening import SoftZCAWhitener
 
 
 def initialize_sae(
@@ -18,13 +19,12 @@ def initialize_sae(
     """Initialize SAE weights, thresholds, and bandwidths."""
     d, V = W_vocab.shape
     F = sae.F
-    device = W_vocab.device
 
     with torch.no_grad():
         sae.W_dec_A.copy_(W_vocab)
         sae.b_dec.data.copy_(whitener.mean)
 
-        free_cols = torch.randn(d, sae.F_free, device=device)
+        free_cols = torch.randn(d, sae.F_free, device="cuda")
         free_cols = free_cols / free_cols.norm(dim=0, keepdim=True)
         sae.W_dec_B.copy_(free_cols)
 
@@ -41,7 +41,7 @@ def initialize_sae(
             sae.W_enc.data[:V] = (whitener._W_white @ W_vocab).T
 
         W_enc_A = sae.W_enc.data[:V]
-        W_enc_B = torch.randn(sae.F_free, d, device=device) / (d**0.5)
+        W_enc_B = torch.randn(sae.F_free, d, device="cuda") / (d**0.5)
 
         n_orthogonal = min(sae.F_free, d - V)
         if n_orthogonal > 0:
@@ -77,6 +77,9 @@ def _calibrate_thresholds(
 
     quantile = 1.0 - L0_target / F
     thresholds = torch.quantile(pre_act, quantile, dim=0)
+    # Floor at eps: features with negative quantiles get near-zero thresholds
+    # (always fire), which is correct — they lack selectivity at this sparsity.
+    thresholds = thresholds.clamp(min=torch.finfo(thresholds.dtype).eps)
     sae.log_threshold.data = thresholds.log()
 
     sae.recalibrate_gamma(pre_act)
@@ -90,17 +93,16 @@ def initialize_from_calibration(
 
     Also measures initial orthogonality to set cal["tau_ortho"] (mutated in-place).
     """
-    from src.model.constraints import compute_orthogonality_violation
-
-    device = cal["W_vocab"].device
-
-    sae = StratifiedSAE(cal["d"], cal["F"], cal["V"]).to(device)
+    sae = StratifiedSAE(cal["d"], cal["F"], cal["V"]).cuda()
 
     samples = []
-    n_needed = min(max(100 * cal["F"] // cal["L0_target"], 10_000), store.batch_size * 20)
+    # F expected active observations per feature (F²/L0 total samples).
+    # Floor: at least one sample per feature. Ceiling: buffer_size tokens (memory).
+    n_stat = cal["F"] * cal["F"] // cal["L0_target"]
+    n_needed = min(max(n_stat, cal["F"]), cal["buffer_size"])
     while sum(s.shape[0] for s in samples) < n_needed:
         samples.append(store.next_batch())
-    activation_sample = torch.cat(samples, dim=0)[:n_needed].to(device)
+    activation_sample = torch.cat(samples, dim=0)[:n_needed]
 
     initialize_sae(
         sae=sae,
@@ -112,9 +114,7 @@ def initialize_from_calibration(
 
     # Set tau_ortho from initialized geometry to keep the first constraint scale data-driven.
     with torch.no_grad():
-        batch_size = min(activation_sample.shape[0], 4096)
-        x_sample = activation_sample[:batch_size]
-        x_tilde = cal["whitener"].forward(x_sample)
+        x_tilde = cal["whitener"].forward(activation_sample)
         _, z_init, _, _, _ = sae(x_tilde)
         raw_ortho = compute_orthogonality_violation(
             z_init, sae.W_dec_A, sae.W_dec_B, 0.0, sae.gamma_init_mean.item()
